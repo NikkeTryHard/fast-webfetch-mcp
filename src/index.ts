@@ -12,17 +12,22 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { Readability } from "@mozilla/readability";
 import { JSDOM } from "jsdom";
 import TurndownService from "turndown";
+import { spawn } from "node:child_process";
 
 // Default max content length (characters)
 const DEFAULT_MAX_LENGTH = 100000;
+const DEFAULT_TIMEOUT_MS = 30000;
+const DEFAULT_MAX_BYTES = 4 * 1024 * 1024;
 
 // Firecrawl config
 const FIRECRAWL_API_URL = process.env.FIRECRAWL_API_URL || "http://localhost:3002";
 
 // AI summarization config
-const AI_API_URL = process.env.FAST_WEBFETCH_API_URL || "http://127.0.0.1:8317/v1";
-const AI_MODEL = process.env.FAST_WEBFETCH_MODEL || "gpt-5.3-codex-low";
+const AI_API_URL = process.env.FAST_WEBFETCH_API_URL || "http://127.0.0.1:8045/v1";
+const AI_MODEL = process.env.FAST_WEBFETCH_MODEL || "gemini-3-flash";
 const AI_API_KEY = process.env.FAST_WEBFETCH_API_KEY || process.env.OPENAI_API_KEY || "";
+const USE_RUST_BACKEND = process.env.FAST_WEBFETCH_USE_RUST === "1";
+const RUST_BACKEND_BIN = process.env.FAST_WEBFETCH_RUST_BIN || "";
 
 // User agents for fallback fetch
 const USER_AGENTS = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"];
@@ -92,6 +97,77 @@ Provide a concise response based only on the content above.`;
   }
 }
 
+async function callRustBackend(url: string, maxLength: number): Promise<ScrapeResult | null> {
+  if (!USE_RUST_BACKEND || !RUST_BACKEND_BIN) return null;
+
+  return await new Promise((resolve) => {
+    const input = JSON.stringify({
+      url,
+      max_length: maxLength,
+      max_bytes: DEFAULT_MAX_BYTES,
+    });
+
+    const child = spawn(RUST_BACKEND_BIN, [], {
+      env: {
+        ...process.env,
+        FAST_WEBFETCH_INPUT: input,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      stdout += chunk.toString();
+    });
+
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      stderr += chunk.toString();
+    });
+
+    child.on("error", () => resolve(null));
+
+    child.on("close", (code) => {
+      if (code !== 0) {
+        resolve(null);
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(stdout);
+        const markdown = typeof parsed.markdown === "string" ? parsed.markdown : "";
+        const title = typeof parsed.title === "string" ? parsed.title : "";
+        const finalUrl = typeof parsed.url === "string" ? parsed.url : url;
+        const statusCode = typeof parsed.status === "number" ? parsed.status : 200;
+        const backend = parsed.backend === "firecrawl" ? "firecrawl" : "fallback";
+
+        if (!markdown) {
+          resolve(null);
+          return;
+        }
+
+        resolve({
+          success: true,
+          markdown,
+          metadata: {
+            title,
+            sourceURL: finalUrl,
+            statusCode,
+          },
+          usedFallback: backend !== "firecrawl",
+        });
+      } catch {
+        if (stderr.trim()) {
+          resolve({ success: false, error: stderr.trim() });
+          return;
+        }
+        resolve(null);
+      }
+    });
+  });
+}
+
 /**
  * Middle-truncate content to preserve beginning and end
  */
@@ -148,7 +224,7 @@ function extractContent(html: string, url: string): { title: string; content: st
  * Fallback: Fetch URL directly with browser UA
  */
 async function directFetch(url: string, options: { timeout?: number } = {}): Promise<{ html: string; status: number; finalUrl: string }> {
-  const { timeout = 30000 } = options;
+  const { timeout = DEFAULT_TIMEOUT_MS } = options;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
 
@@ -176,6 +252,42 @@ async function directFetch(url: string, options: { timeout?: number } = {}): Pro
   } catch (error) {
     clearTimeout(timeoutId);
     throw error;
+  }
+}
+
+async function directFetchJson(url: string, timeout = DEFAULT_TIMEOUT_MS): Promise<{ status: number; data?: unknown; error?: string }> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": getRandomUserAgent(),
+      },
+      signal: controller.signal,
+      redirect: "follow",
+    });
+
+    if (!response.ok) {
+      return { status: response.status, error: `HTTP ${response.status}` };
+    }
+
+    const text = await response.text();
+    if (text.length > DEFAULT_MAX_BYTES) {
+      return { status: 413, error: `Response too large (${text.length} bytes)` };
+    }
+
+    try {
+      return { status: response.status, data: JSON.parse(text) };
+    } catch {
+      return { status: response.status, error: "Invalid JSON response" };
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { status: 500, error: message };
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
@@ -207,9 +319,17 @@ async function scrapeUrl(
     timeout?: number;
   } = {},
 ): Promise<ScrapeResult> {
-  const { formats = ["markdown"], onlyMainContent = true, timeout = 30000 } = options;
+  const { formats = ["markdown"], onlyMainContent = true, timeout = DEFAULT_TIMEOUT_MS } = options;
+
+  if (formats.length === 1 && formats[0] === "markdown") {
+    const rustResult = await callRustBackend(url, DEFAULT_MAX_LENGTH);
+    if (rustResult?.success) {
+      return rustResult;
+    }
+  }
 
   // Try Firecrawl first
+  let firecrawlErrorMessage = "";
   try {
     const response = await fetch(`${FIRECRAWL_API_URL}/v1/scrape`, {
       method: "POST",
@@ -238,9 +358,11 @@ async function scrapeUrl(
           usedFallback: false,
         };
       }
+    } else {
+      firecrawlErrorMessage = `Firecrawl HTTP ${response.status}`;
     }
-  } catch {
-    // Firecrawl not available, fall through to fallback
+  } catch (error) {
+    firecrawlErrorMessage = error instanceof Error ? error.message : String(error);
   }
 
   // Fallback: Direct fetch with Readability
@@ -293,7 +415,7 @@ async function scrapeUrl(
     const message = error instanceof Error ? error.message : String(error);
     return {
       success: false,
-      error: message,
+      error: firecrawlErrorMessage ? `Firecrawl failed (${firecrawlErrorMessage}); fallback failed (${message})` : message,
     };
   }
 }
@@ -504,33 +626,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "fast_fetch_json": {
         const url = args.url as string;
 
-        // For JSON, we use direct fetch since Firecrawl is for HTML
-        const response = await fetch(url, {
-          headers: {
-            Accept: "application/json",
-            "User-Agent": getRandomUserAgent(),
-          },
-        });
-
-        if (!response.ok) {
+        const jsonResult = await directFetchJson(url);
+        if (jsonResult.error || typeof jsonResult.data === "undefined") {
           return {
             content: [
               {
                 type: "text",
-                text: `Error: HTTP ${response.status} fetching ${url}`,
+                text: `Error: ${jsonResult.error || "Unknown error"} fetching ${url}`,
               },
             ],
             isError: true,
           };
         }
 
-        const json = await response.json();
-
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify(json, null, 2),
+              text: JSON.stringify(jsonResult.data, null, 2),
             },
           ],
         };
@@ -561,19 +674,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }),
         );
 
+        type MultiFetchItem =
+          | { url: string; error: string }
+          | { url: string; title: string; content: string };
+
         const output = results
           .map((result, i) => {
             if (result.status === "rejected") {
               return `## ${urls[i]}\n\nError: ${result.reason}`;
             }
 
-            const { url, title, content, error } = result.value as any;
+            const item = result.value as MultiFetchItem;
 
-            if (error) {
-              return `## ${url}\n\nError: ${error}`;
+            if ("error" in item) {
+              return `## ${item.url}\n\nError: ${item.error}`;
             }
 
-            return `## ${title || url}\n\n**URL:** ${url}\n\n${content}`;
+            return `## ${item.title || item.url}\n\n**URL:** ${item.url}\n\n${item.content}`;
           })
           .join("\n\n---\n\n");
 

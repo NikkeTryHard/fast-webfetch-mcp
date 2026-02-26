@@ -48,9 +48,11 @@ cd ~/fast-webfetch-mcp && bun install
 # Add MCP server with environment variables
 claude mcp add fast-webfetch \
   -e FIRECRAWL_API_URL=http://localhost:3002 \
-  -e FAST_WEBFETCH_API_URL=http://127.0.0.1:8317/v1 \
-  -e FAST_WEBFETCH_MODEL=gpt-5.3-codex-low \
-  -e FAST_WEBFETCH_API_KEY=nikketryhard \
+  -e FAST_WEBFETCH_API_URL=http://127.0.0.1:8045/v1 \
+  -e FAST_WEBFETCH_MODEL=gemini-3-flash \
+  -e FAST_WEBFETCH_API_KEY=your_api_key_here \
+  -e FAST_WEBFETCH_USE_RUST=1 \
+  -e FAST_WEBFETCH_RUST_BIN=/home/YOUR_USERNAME/fast-webfetch-mcp/rust/target/release/fast-webfetch-mcp-rs \
   -- bun run ~/fast-webfetch-mcp/src/index.ts
 
 # Or minimal (uses defaults)
@@ -77,9 +79,11 @@ Then add to `~/.claude.json`:
       "args": ["run", "/home/YOUR_USERNAME/fast-webfetch-mcp/src/index.ts"],
       "env": {
         "FIRECRAWL_API_URL": "http://localhost:3002",
-        "FAST_WEBFETCH_API_URL": "http://127.0.0.1:8317/v1",
-        "FAST_WEBFETCH_MODEL": "gpt-5.3-codex-low",
-        "FAST_WEBFETCH_API_KEY": "nikketryhard"
+        "FAST_WEBFETCH_API_URL": "http://127.0.0.1:8045/v1",
+        "FAST_WEBFETCH_MODEL": "gemini-3-flash",
+        "FAST_WEBFETCH_API_KEY": "your_api_key_here",
+        "FAST_WEBFETCH_USE_RUST": "1",
+        "FAST_WEBFETCH_RUST_BIN": "/home/YOUR_USERNAME/fast-webfetch-mcp/rust/target/release/fast-webfetch-mcp-rs"
       }
     }
   }
@@ -91,9 +95,11 @@ Then add to `~/.claude.json`:
 | Variable                | Default                    | Description                         |
 | ----------------------- | -------------------------- | ----------------------------------- |
 | `FIRECRAWL_API_URL`     | `http://localhost:3002`    | Firecrawl API endpoint              |
-| `FAST_WEBFETCH_API_URL` | `http://127.0.0.1:8317/v1` | OpenAI-compatible API for summaries |
-| `FAST_WEBFETCH_MODEL`   | `gpt-5.3-codex-low`        | Model name for summarization        |
-| `FAST_WEBFETCH_API_KEY` | `nikketryhard`             | API key for summarization endpoint  |
+| `FAST_WEBFETCH_API_URL` | `http://127.0.0.1:8045/v1` | OpenAI-compatible API for summaries |
+| `FAST_WEBFETCH_MODEL`   | `gemini-3-flash`           | Model name for summarization        |
+| `FAST_WEBFETCH_API_KEY` | _(empty)_                  | API key for summarization endpoint  |
+| `FAST_WEBFETCH_USE_RUST`| `0`                        | Enable Rust backend worker path     |
+| `FAST_WEBFETCH_RUST_BIN`| _(empty)_                  | Absolute path to Rust binary        |
 
 ## Firecrawl Setup (Optional but Recommended)
 

@@ -11,13 +11,14 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_MAX_LENGTH: usize = 100_000;
 const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024;
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const FIRECRAWL_API_URL: &str = "http://localhost:3002";
+const DEFAULT_FIRECRAWL_API_URL: &str = "http://localhost:3002";
 
 #[derive(Debug, Clone)]
 struct AppConfig {
     max_length: usize,
     max_bytes: usize,
     timeout_ms: u64,
+    firecrawl_api_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,6 +150,7 @@ fn extract_title(html: &str) -> String {
 
 async fn scrape_firecrawl(
     client: &Client,
+    firecrawl_api_url: &str,
     url: &str,
     timeout_ms: u64,
     max_bytes: usize,
@@ -161,7 +163,7 @@ async fn scrape_firecrawl(
     };
 
     let response = match client
-        .post(format!("{FIRECRAWL_API_URL}/v1/scrape"))
+        .post(format!("{firecrawl_api_url}/v1/scrape"))
         .header("Content-Type", "application/json")
         .json(&req)
         .send()
@@ -235,7 +237,11 @@ async fn main() -> Result<()> {
     let config = AppConfig {
         max_length: input.max_length.unwrap_or(DEFAULT_MAX_LENGTH),
         max_bytes: input.max_bytes.unwrap_or(DEFAULT_MAX_BYTES),
-        timeout_ms: 30_000,
+        timeout_ms: env::var("FAST_WEBFETCH_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30_000),
+        firecrawl_api_url: env::var("FIRECRAWL_API_URL").unwrap_or_else(|_| DEFAULT_FIRECRAWL_API_URL.to_owned()),
     };
 
     let client = Client::builder()
@@ -248,7 +254,15 @@ async fn main() -> Result<()> {
         .context("failed to build reqwest client")?;
 
     let (title, markdown, final_url, status, bytes_read, backend) =
-        match scrape_firecrawl(&client, &input.url, config.timeout_ms, config.max_bytes).await? {
+        match scrape_firecrawl(
+            &client,
+            &config.firecrawl_api_url,
+            &input.url,
+            config.timeout_ms,
+            config.max_bytes,
+        )
+        .await?
+        {
             Some((firecrawl_markdown, firecrawl_title, firecrawl_final, firecrawl_status, read)) => {
                 let cleaned_final = firecrawl_final.trim_start_matches("firecrawl:").to_owned();
                 (
