@@ -20,8 +20,9 @@ const DEFAULT_MAX_LENGTH = 100000;
 const FIRECRAWL_API_URL = process.env.FIRECRAWL_API_URL || "http://localhost:3002";
 
 // AI summarization config
-const AI_API_URL = process.env.FAST_WEBFETCH_API_URL || "http://127.0.0.1:8045/v1";
-const AI_MODEL = process.env.FAST_WEBFETCH_MODEL || "gemini-3-flash";
+const AI_API_URL = process.env.FAST_WEBFETCH_API_URL || "http://127.0.0.1:8317/v1";
+const AI_MODEL = process.env.FAST_WEBFETCH_MODEL || "gpt-5.3-codex-low";
+const AI_API_KEY = process.env.FAST_WEBFETCH_API_KEY || process.env.OPENAI_API_KEY || "";
 
 // User agents for fallback fetch
 const USER_AGENTS = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"];
@@ -55,11 +56,17 @@ ${userPrompt}
 Provide a concise response based only on the content above.`;
 
   try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    if (AI_API_KEY) {
+      headers.Authorization = `Bearer ${AI_API_KEY}`;
+    }
+
     const response = await fetch(`${AI_API_URL}/chat/completions`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+      headers,
       body: JSON.stringify({
         model: AI_MODEL,
         messages: [
