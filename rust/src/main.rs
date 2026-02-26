@@ -28,6 +28,8 @@ struct Input {
     max_length: Option<usize>,
     #[serde(default)]
     max_bytes: Option<usize>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -237,9 +239,9 @@ async fn main() -> Result<()> {
     let config = AppConfig {
         max_length: input.max_length.unwrap_or(DEFAULT_MAX_LENGTH),
         max_bytes: input.max_bytes.unwrap_or(DEFAULT_MAX_BYTES),
-        timeout_ms: env::var("FAST_WEBFETCH_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
+        timeout_ms: input
+            .timeout_ms
+            .or_else(|| env::var("FAST_WEBFETCH_TIMEOUT_MS").ok().and_then(|v| v.parse::<u64>().ok()))
             .unwrap_or(30_000),
         firecrawl_api_url: env::var("FIRECRAWL_API_URL").unwrap_or_else(|_| DEFAULT_FIRECRAWL_API_URL.to_owned()),
     };

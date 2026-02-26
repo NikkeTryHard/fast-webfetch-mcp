@@ -97,14 +97,23 @@ Provide a concise response based only on the content above.`;
   }
 }
 
-async function callRustBackend(url: string, maxLength: number): Promise<ScrapeResult | null> {
-  if (!USE_RUST_BACKEND || !RUST_BACKEND_BIN) return null;
+type RustBackendAttempt =
+  | { status: "disabled" }
+  | { status: "bootstrap_error"; message: string }
+  | { status: "worker_error"; result: ScrapeResult }
+  | { status: "ok"; result: ScrapeResult };
+
+async function callRustBackend(url: string, maxLength: number, timeoutMs: number): Promise<RustBackendAttempt> {
+  if (!USE_RUST_BACKEND || !RUST_BACKEND_BIN) {
+    return { status: "disabled" };
+  }
 
   return await new Promise((resolve) => {
     const input = JSON.stringify({
       url,
       max_length: maxLength,
       max_bytes: DEFAULT_MAX_BYTES,
+      timeout_ms: timeoutMs,
     });
 
     const child = spawn(RUST_BACKEND_BIN, [], {
@@ -117,6 +126,22 @@ async function callRustBackend(url: string, maxLength: number): Promise<ScrapeRe
 
     let stdout = "";
     let stderr = "";
+    let settled = false;
+
+    const settle = (result: RustBackendAttempt): void => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+
+    const timeoutId = setTimeout(() => {
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 1000);
+      settle({
+        status: "bootstrap_error",
+        message: `Rust backend timed out after ${timeoutMs}ms`,
+      });
+    }, timeoutMs + 1000);
 
     child.stdout.on("data", (chunk: Buffer | string) => {
       stdout += chunk.toString();
@@ -126,11 +151,30 @@ async function callRustBackend(url: string, maxLength: number): Promise<ScrapeRe
       stderr += chunk.toString();
     });
 
-    child.on("error", () => resolve(null));
+    child.on("error", (error) => {
+      clearTimeout(timeoutId);
+      settle({
+        status: "bootstrap_error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
 
     child.on("close", (code) => {
+      clearTimeout(timeoutId);
+
       if (code !== 0) {
-        resolve(null);
+        settle({
+          status: "worker_error",
+          result: {
+            success: false,
+            error: `Rust backend exited with code ${code}`,
+            errorDetails: {
+              stage: "rust",
+              kind: "runtime",
+              message: stderr.trim() || `exit code ${code}`,
+            },
+          },
+        });
         return;
       }
 
@@ -143,26 +187,63 @@ async function callRustBackend(url: string, maxLength: number): Promise<ScrapeRe
         const backend = parsed.backend === "firecrawl" ? "firecrawl" : "fallback";
 
         if (!markdown) {
-          resolve(null);
+          settle({
+            status: "worker_error",
+            result: {
+              success: false,
+              error: "Rust backend returned empty markdown",
+              errorDetails: {
+                stage: "rust",
+                kind: "parse",
+                message: "markdown missing or empty",
+              },
+            },
+          });
           return;
         }
 
-        resolve({
-          success: true,
-          markdown,
-          metadata: {
-            title,
-            sourceURL: finalUrl,
-            statusCode,
+        settle({
+          status: "ok",
+          result: {
+            success: true,
+            markdown,
+            metadata: {
+              title,
+              sourceURL: finalUrl,
+              statusCode,
+            },
+            usedFallback: backend !== "firecrawl",
           },
-          usedFallback: backend !== "firecrawl",
         });
-      } catch {
+      } catch (error) {
+        const parseMessage = error instanceof Error ? error.message : String(error);
         if (stderr.trim()) {
-          resolve({ success: false, error: stderr.trim() });
+          settle({
+            status: "worker_error",
+            result: {
+              success: false,
+              error: "Rust backend returned invalid JSON",
+              errorDetails: {
+                stage: "rust",
+                kind: "parse",
+                message: `${parseMessage}; stderr: ${stderr.trim()}`,
+              },
+            },
+          });
           return;
         }
-        resolve(null);
+        settle({
+          status: "worker_error",
+          result: {
+            success: false,
+            error: "Rust backend returned invalid JSON",
+            errorDetails: {
+              stage: "rust",
+              kind: "parse",
+              message: parseMessage,
+            },
+          },
+        });
       }
     });
   });
@@ -305,6 +386,11 @@ type ScrapeResult = {
     statusCode?: number;
   };
   error?: string;
+  errorDetails?: {
+    stage: "rust" | "firecrawl" | "fallback" | "json";
+    kind: "timeout" | "spawn" | "parse" | "http" | "runtime" | "unknown";
+    message: string;
+  };
   usedFallback?: boolean;
 };
 
@@ -322,14 +408,19 @@ async function scrapeUrl(
   const { formats = ["markdown"], onlyMainContent = true, timeout = DEFAULT_TIMEOUT_MS } = options;
 
   if (formats.length === 1 && formats[0] === "markdown") {
-    const rustResult = await callRustBackend(url, DEFAULT_MAX_LENGTH);
-    if (rustResult?.success) {
-      return rustResult;
+    const rustAttempt = await callRustBackend(url, DEFAULT_MAX_LENGTH, timeout);
+    if (rustAttempt.status === "ok") {
+      return rustAttempt.result;
+    }
+    if (rustAttempt.status === "worker_error") {
+      return rustAttempt.result;
     }
   }
 
   // Try Firecrawl first
   let firecrawlErrorMessage = "";
+  const firecrawlAbort = new AbortController();
+  const firecrawlTimeoutId = setTimeout(() => firecrawlAbort.abort(), timeout);
   try {
     const response = await fetch(`${FIRECRAWL_API_URL}/v1/scrape`, {
       method: "POST",
@@ -342,6 +433,7 @@ async function scrapeUrl(
         onlyMainContent,
         timeout,
       }),
+      signal: firecrawlAbort.signal,
     });
 
     if (response.ok) {
@@ -363,6 +455,8 @@ async function scrapeUrl(
     }
   } catch (error) {
     firecrawlErrorMessage = error instanceof Error ? error.message : String(error);
+  } finally {
+    clearTimeout(firecrawlTimeoutId);
   }
 
   // Fallback: Direct fetch with Readability
