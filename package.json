@@ -1,0 +1,32 @@
+{
+  "name": "fast-webfetch-mcp",
+  "version": "1.1.0",
+  "description": "High-performance MCP server for web fetching in Claude Code - no blocked sites, full content",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun run --watch src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@mozilla/readability": "^0.5.0",
+    "jsdom": "^24.0.0",
+    "turndown": "^7.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "@types/turndown": "^5.0.4",
+    "typescript": "^5.9.3"
+  }, 
+  "keywords": [
+    "mcp",
+    "claude-code",
+    "webfetch",
+    "scraper",
+    "fetch"
+  ],
+  "author": "",
+  "license": "MIT"
+}
