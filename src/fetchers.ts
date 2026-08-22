@@ -69,27 +69,31 @@ async function fetchScrape(
   }
 }
 
-
 export function fetchMarkdown(
   url: string,
   maxLength: number,
   timeoutMs: number,
   noTruncate = false,
   outerTimeoutMs = timeoutMs + WORKER_REPORT_GRACE_MS,
+  renderOptions?: Record<string, unknown>,
 ): Promise<ScrapeResult> {
-  return fetchScrape({ url, max_length: maxLength, no_truncate: noTruncate }, url, "markdown", timeoutMs, outerTimeoutMs);
+  const workerInput: Record<string, unknown> = { url, max_length: maxLength, no_truncate: noTruncate };
+  if (renderOptions) workerInput.options = renderOptions;
+  return fetchScrape(workerInput, url, "markdown", timeoutMs, outerTimeoutMs);
 }
 
-export function fetchRawHtml(url: string, maxLength: number, timeoutMs: number): Promise<ScrapeResult> {
-  return fetchScrape({ url, max_length: maxLength, raw_html: true }, url, "raw_html", timeoutMs, timeoutMs + WORKER_REPORT_GRACE_MS);
+export function fetchRawHtml(url: string, maxLength: number, timeoutMs: number, renderOptions?: Record<string, unknown>): Promise<ScrapeResult> {
+  const workerInput: Record<string, unknown> = { url, max_length: maxLength, raw_html: true };
+  if (renderOptions) workerInput.options = renderOptions;
+  return fetchScrape(workerInput, url, "raw_html", timeoutMs, timeoutMs + WORKER_REPORT_GRACE_MS);
 }
 
-export async function fetchMarkdownBatch(urls: string[], maxLength: number, timeoutMs: number): Promise<BatchItem[] | string> {
+export async function fetchMarkdownBatch(urls: string[], maxLength: number, timeoutMs: number, renderOptions?: Record<string, unknown>): Promise<BatchItem[] | string> {
   const permitCount = Math.max(1, Math.min(CONFIG.multipleConcurrency, urls.length));
-  const run = await runWorker({ urls, max_length: maxLength }, timeoutMs, permitCount);
-  if (!run.ok) {
-    return withLog("fast_fetch_multiple", workerFailureText(run.failure), run.failure, { urls, max_length: maxLength });
-  }
+  const workerInput: Record<string, unknown> = { urls, max_length: maxLength };
+  if (renderOptions) workerInput.options = renderOptions;
+  const run = await runWorker(workerInput, timeoutMs, permitCount);
+  if (!run.ok) return workerFailureText(run.failure);
 
   try {
     const parsed = parseWorkerJson(run.stdout);

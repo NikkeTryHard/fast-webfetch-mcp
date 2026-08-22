@@ -66,3 +66,18 @@ export function resolveTimeoutMs(args: Record<string, unknown>): number {
   const requested = positiveNumber(args.timeout_ms);
   return Math.max(1_000, Math.min(requested ?? CONFIG.timeoutMs, MAX_CRAWL_TIMEOUT_MS));
 }
+
+/** Per-call rendering knobs. Unknown/mistyped keys are dropped, not trusted —
+ * this payload goes straight into CrawlerRunConfig on the Python side. */
+export function resolveRenderOptions(args: Record<string, unknown>): Record<string, unknown> | undefined {
+  const raw = args.options;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const source = raw as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const key of ["full_page", "iframes", "drop_overlays"] as const) {
+    if (source[key] === true) out[key] = true;
+  }
+  const settle = source.wait_seconds;
+  if (typeof settle === "number" && Number.isFinite(settle) && settle > 0) out.wait_seconds = settle;
+  return Object.keys(out).length ? out : undefined;
+}

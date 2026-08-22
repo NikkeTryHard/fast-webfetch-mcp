@@ -4,9 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { isSeriousFailure, writeErrorLog } from "../src/diagnostics.js";
+import { resolveRenderOptions } from "../src/config.js";
 import { withLog } from "../src/fetchers.js";
 import type { WorkerFailure } from "../src/types.js";
-
 const logsDir = mkdtempSync(join(tmpdir(), "fwf-logs-"));
 process.env.FAST_WEBFETCH_LOGS_DIR = logsDir;
 
@@ -50,5 +50,18 @@ describe("writeErrorLog", () => {
     expect(path).toBeDefined();
     expect(path!.startsWith(logsDir)).toBe(true);
     expect(JSON.parse(readFileSync(path!, "utf8")).hello).toBe("world");
+  });
+});
+
+describe("resolveRenderOptions", () => {
+  test("keeps only well-typed knobs", () => {
+    expect(resolveRenderOptions({ options: { full_page: true, wait_seconds: 1.5, iframes: "yes", drop_overlays: false, evil: {} } }))
+      .toEqual({ full_page: true, wait_seconds: 1.5 });
+  });
+
+  test("rejects non-object and empty payloads", () => {
+    expect(resolveRenderOptions({ options: "networkidle" })).toBeUndefined();
+    expect(resolveRenderOptions({ options: {} })).toBeUndefined();
+    expect(resolveRenderOptions({})).toBeUndefined();
   });
 });

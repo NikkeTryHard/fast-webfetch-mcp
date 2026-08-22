@@ -7,13 +7,23 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
-import { CONFIG, MAX_CRAWL_TIMEOUT_MS, REQUEST_BUDGET_MS, TRANSPORT_MARGIN_MS, WORKER_REPORT_GRACE_MS, asArgs, readPositiveInt, resolveMaxLength, resolveTimeoutMs } from "./config.js";
+import { CONFIG, MAX_CRAWL_TIMEOUT_MS, REQUEST_BUDGET_MS, TRANSPORT_MARGIN_MS, WORKER_REPORT_GRACE_MS, asArgs, readPositiveInt, resolveMaxLength, resolveRenderOptions, resolveTimeoutMs } from "./config.js";
 import { fetchMarkdown, fetchMarkdownBatch, fetchRawHtml } from "./fetchers.js";
 import { metadataHeader, renderSingle } from "./render.js";
 import { summarizeContent } from "./summary.js";
+/** Shared by all three tools; resolved by resolveRenderOptions on the way in. */
+const RENDER_OPTIONS_SCHEMA = {
+  type: "object",
+  properties: {
+    full_page: { type: "boolean", description: "Scroll the entire page before extraction — captures lazy-load and infinite-scroll content. Slower." },
+    wait_seconds: { type: "number", description: "Settle delay before capture, e.g. 1.5 for pages that hydrate late." },
+    iframes: { type: "boolean", description: "Pull iframe content into the result." },
+    drop_overlays: { type: "boolean", description: "Remove cookie banners and modals before extraction." },
+  },
+};
 
 const server = new Server(
-  { name: "fast-webfetch", version: "1.1.0" },
+  { name: "fast-webfetch", version: "1.2.0" },
   { capabilities: { tools: {} } },
 );
 
@@ -32,6 +42,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           max_length: { type: "number", description: `Maximum returned Markdown chars. Default ${CONFIG.maxLength}; hard max ${CONFIG.hardMaxLength}. Raise when page truncation hides needed facts.` },
           full_content: { type: "boolean", description: `Use hard max ${CONFIG.hardMaxLength} chars instead of default cap. Use for long docs/specs/source pages.` },
           timeout_ms: { type: "number", description: `Fetch timeout ms. Default ${CONFIG.timeoutMs}; max ${MAX_CRAWL_TIMEOUT_MS}.` },
+          options: RENDER_OPTIONS_SCHEMA,
         },
         required: ["url"],
       },
@@ -46,6 +57,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           max_length: { type: "number", description: `Maximum returned HTML chars. Default ${CONFIG.maxLength}; hard max ${CONFIG.hardMaxLength}.` },
           full_content: { type: "boolean", description: `Use hard max ${CONFIG.hardMaxLength} chars instead of default cap. Use when required markup may be late in document.` },
           timeout_ms: { type: "number", description: `Fetch timeout ms. Default ${CONFIG.timeoutMs}; max ${MAX_CRAWL_TIMEOUT_MS}.` },
+          options: RENDER_OPTIONS_SCHEMA,
         },
         required: ["url"],
       },
@@ -75,6 +87,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "boolean",
             description: `Use hard max ${CONFIG.hardMaxLength} chars per URL instead of default cap. Use for long docs/specs/source pages.`,
           },
+          options: RENDER_OPTIONS_SCHEMA,
           timeout_ms: {
             type: "number",
             description: `Whole batch timeout ms. Default ${CONFIG.timeoutMs}; max ${MAX_CRAWL_TIMEOUT_MS}.`,
@@ -93,6 +106,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     const maxLength = resolveMaxLength(args);
     const timeoutMs = resolveTimeoutMs(args);
+    const renderOptions = resolveRenderOptions(args);
 
     if (name === "fast_fetch") {
       const requestStartedAt = Date.now();
@@ -101,7 +115,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const prompt = !CONFIG.disableSummary && typeof args.prompt === "string" && args.prompt.trim() ? args.prompt.trim() : undefined;
       const crawlBudgetMs = timeoutMs;
       const workerBudgetMs = Math.min(requestDeadline - requestStartedAt - TRANSPORT_MARGIN_MS, crawlBudgetMs + WORKER_REPORT_GRACE_MS);
-      const result = await fetchMarkdown(url, maxLength, crawlBudgetMs, prompt !== undefined, workerBudgetMs);
+      const result = await fetchMarkdown(url, maxLength, crawlBudgetMs, prompt !== undefined, workerBudgetMs, renderOptions);
 
       if (!result.success) {
         return { content: [{ type: "text", text: `Error fetching ${url}: ${result.error}` }], isError: true };
@@ -119,7 +133,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (name === "fast_fetch_raw") {
       const url = args.url as string;
-      const result = await fetchRawHtml(url, maxLength, timeoutMs);
+      const result = await fetchRawHtml(url, maxLength, timeoutMs, renderOptions);
       if (!result.success) {
         return { content: [{ type: "text", text: `Error fetching ${url}: ${result.error}` }], isError: true };
       }
@@ -128,7 +142,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (name === "fast_fetch_multiple") {
       const urls = Array.isArray(args.urls) ? (args.urls as string[]) : [];
-      const result = await fetchMarkdownBatch(urls, maxLength, timeoutMs);
+      const result = await fetchMarkdownBatch(urls, maxLength, timeoutMs, renderOptions);
       if (typeof result === "string") {
         return { content: [{ type: "text", text: `Error fetching multiple URLs: ${result}` }], isError: true };
       }
@@ -197,5 +211,5 @@ if (process.env.FAST_WEBFETCH_SMOKE_URL) {
 } else {
   const transport = new StdioServerTransport();
   server.connect(transport);
-  console.error("Fast WebFetch MCP server v1.1.0 running (local Crawl4AI)");
+  console.error("Fast WebFetch MCP server v1.2.0 running (local Crawl4AI)");
 }

@@ -74,10 +74,15 @@ def elapsed_ms(started: float) -> int:
     return round((asyncio.get_running_loop().time() - started) * 1000)
 
 
-def crawl_configs(timeout_ms: int) -> tuple[Any, Any]:
+def truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def crawl_configs(timeout_ms: int, options: dict[str, Any] | None = None) -> tuple[Any, Any]:
     from crawl4ai import BrowserConfig, CacheMode, CrawlerRunConfig
     from crawl4ai.async_configs import ProxyConfig
 
+    options = options or {}
     proxy_url = os.getenv("CRAWL4AI_PROXY_URL", "").strip()
     proxy_config = ProxyConfig(server=proxy_url) if proxy_url else None
     browser_kwargs: dict[str, Any] = {}
@@ -89,16 +94,24 @@ def crawl_configs(timeout_ms: int) -> tuple[Any, Any]:
         browser_kwargs["proxy_config"] = proxy_config
     if os.getenv("CRAWL4AI_USER_AGENT"):
         browser_kwargs["user_agent"] = os.getenv("CRAWL4AI_USER_AGENT")
-    if os.getenv("CRAWL4AI_STEALTH"):
-        browser_kwargs["enable_stealth"] = os.getenv("CRAWL4AI_STEALTH") == "1"
+    # Stealth is on by default: it defeats the cheap bot checks most sites run,
+    # at effectively no cost. Opt out with CRAWL4AI_STEALTH=0.
+    browser_kwargs["enable_stealth"] = truthy(os.getenv("CRAWL4AI_STEALTH", "1"))
 
     run_kwargs: dict[str, Any] = {"cache_mode": CacheMode.BYPASS, "page_timeout": timeout_ms}
-    if os.getenv("CRAWL4AI_SCAN_FULL_PAGE"):
-        run_kwargs["scan_full_page"] = os.getenv("CRAWL4AI_SCAN_FULL_PAGE") == "1"
+    if options.get("full_page") or os.getenv("CRAWL4AI_SCAN_FULL_PAGE") == "1":
+        run_kwargs["scan_full_page"] = True
     if os.getenv("CRAWL4AI_WAIT_UNTIL"):
         run_kwargs["wait_until"] = os.getenv("CRAWL4AI_WAIT_UNTIL")
-    if os.getenv("CRAWL4AI_DELAY_SECONDS"):
+    settle = options.get("wait_seconds")
+    if isinstance(settle, (int, float)) and settle > 0:
+        run_kwargs["delay_before_return_html"] = float(settle)
+    elif os.getenv("CRAWL4AI_DELAY_SECONDS"):
         run_kwargs["delay_before_return_html"] = float(os.getenv("CRAWL4AI_DELAY_SECONDS", "0"))
+    if options.get("iframes"):
+        run_kwargs["process_iframes"] = True
+    if options.get("drop_overlays"):
+        run_kwargs["remove_overlay_elements"] = True
     return BrowserConfig(**browser_kwargs), CrawlerRunConfig(**run_kwargs)
 
 
@@ -176,11 +189,14 @@ async def crawl_with_retry(
     return serialize_result(result, url, max_length, timeout_ms, started, raw_html=raw_html, no_truncate=no_truncate)
 
 
-async def crawl_one(url: str, max_length: int, timeout_ms: int, raw_html: bool = False, no_truncate: bool = False) -> dict[str, Any]:
+async def crawl_one(
+    url: str, max_length: int, timeout_ms: int,
+    raw_html: bool = False, no_truncate: bool = False, options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     started = asyncio.get_running_loop().time()
     try:
         from crawl4ai import AsyncWebCrawler
-        browser_config, run_config = crawl_configs(timeout_ms)
+        browser_config, run_config = crawl_configs(timeout_ms, options)
         with contextlib.redirect_stdout(sys.stderr):
             async with asyncio.timeout(timeout_ms / 1000):
                 async with AsyncWebCrawler(config=browser_config) as crawler:
@@ -202,7 +218,7 @@ async def crawl_one(url: str, max_length: int, timeout_ms: int, raw_html: bool =
 
 async def crawl_many(
     urls: list[str], max_length: int, timeout_ms: int, concurrency: int,
-    raw_html: bool = False, no_truncate: bool = False,
+    raw_html: bool = False, no_truncate: bool = False, options: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     started = asyncio.get_running_loop().time()
     results: list[dict[str, Any] | None] = [None] * len(urls)
@@ -212,7 +228,7 @@ async def crawl_many(
     tasks: list[asyncio.Task[None]] = []
     try:
         from crawl4ai import AsyncWebCrawler
-        browser_config, run_config = crawl_configs(timeout_ms)
+        browser_config, run_config = crawl_configs(timeout_ms, options)
         with contextlib.redirect_stdout(sys.stderr):
             async with asyncio.timeout(timeout_ms / 1000):
                 async with AsyncWebCrawler(config=browser_config) as crawler:
@@ -274,6 +290,7 @@ async def main() -> int:
     concurrency = positive_int(payload.get("concurrency"), DEFAULT_CONCURRENCY, MAX_CONCURRENCY)
     raw_html = bool(payload.get("raw_html"))
     no_truncate = bool(payload.get("no_truncate"))
+    options = payload.get("options") if isinstance(payload.get("options"), dict) else None
     urls = payload.get("urls") or ([payload["url"]] if payload.get("url") else [])
     if not urls:
         print(json.dumps(error_result(
@@ -288,13 +305,13 @@ async def main() -> int:
     # server rejects non-array batch output ("non-array batch JSON"), so
     # keying the shape on count broke single-URL batches.
     if len(string_urls) == 1 and not payload.get("urls"):
-        result = await crawl_one(string_urls[0], max_length, timeout_ms, raw_html=raw_html, no_truncate=no_truncate)
+        result = await crawl_one(string_urls[0], max_length, timeout_ms, raw_html=raw_html, no_truncate=no_truncate, options=options)
         print(json.dumps(result, ensure_ascii=False))
         return 0
 
     results = await crawl_many(
         string_urls, max_length, timeout_ms, concurrency,
-        raw_html=raw_html, no_truncate=no_truncate,
+        raw_html=raw_html, no_truncate=no_truncate, options=options,
     )
     print(json.dumps(results, ensure_ascii=False))
     return 0
