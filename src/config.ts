@@ -42,7 +42,7 @@ export const CONFIG = {
   crawl4aiWorker:
     process.env.FAST_WEBFETCH_WORKER || join(PACKAGE_ROOT, "crawl4ai_worker.py"),
   geminiApiKeyFile:
-    process.env.GEMINI_API_KEY_FILE || "/home/cachybtw/.config/opencode/keys/.gemini-api-key",
+    process.env.GEMINI_API_KEY_FILE || join(process.env.HOME || "~", ".config/opencode/keys/.gemini-api-key"),
   geminiTimeoutMs: 15_000,
   disableSummary: process.env.FAST_WEBFETCH_DISABLE_SUMMARY === "1",
 } as const;

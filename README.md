@@ -4,9 +4,9 @@ A web-fetching MCP server that renders pages with a real browser running on
 your own machine, then hands the model clean Markdown instead of a token
 bill for 2MB of JavaScript.
 
-No API keys for fetching. No per-page pricing. No "this page blocked us"
-when the block was really a headless-detection script that a real Chromium
-walks straight through.
+Fetching costs nothing here: no API keys, no per-page pricing. And when a
+site claims to block you, it is often just a headless-detection script that
+a real Chromium walks straight through.
 
 ## How it works
 
@@ -78,9 +78,9 @@ VPN so sites see your real IP. Plain `"command": "bun"` works identically.
 |---|---|---|---|
 | `url` | string | required | |
 | `prompt` | string | — | If set, a grounded answer instead of the full page |
-| `max_length` | number | 40 000 | Middle-truncation keeps head and tail |
-| `full_content` | boolean | false | Raise cap to 100 000 chars |
-| `timeout_ms` | number | 25 000 | Hard ceiling, browser render included |
+| `max_length` | number | 40,000 | Middle-truncation keeps head and tail |
+| `full_content` | boolean | false | Raise cap to 100,000 chars |
+| `timeout_ms` | number | 25,000 | Hard ceiling, browser render included |
 
 ### `fast_fetch_raw` — one URL to raw HTML
 
@@ -92,9 +92,9 @@ tables, `data-` attributes, meta tags, exact markup.
 | Argument | Type | Default | Notes |
 |---|---|---|---|
 | `urls` | string[] | required | 1–15 absolute http(s) URLs |
-| `max_length` | number | 40 000 | Per URL |
+| `max_length` | number | 40,000 | Per URL |
 | `full_content` | boolean | false | Per URL |
-| `timeout_ms` | number | 25 000 | Whole batch, shared |
+| `timeout_ms` | number | 25,000 | Whole batch, shared |
 
 Each URL comes back as its own section with a metadata header (`url`,
 `status`, `elapsed_ms`, `truncated`). One slow site cannot starve the others —
@@ -131,16 +131,18 @@ All optional, all environment variables.
 
 ## Behavior worth knowing
 
-- **Empty pages get a second chance.** JS-heavy sites often return a shell
-  under the default wait strategy. When a 200 comes back with no content, the
-  worker retries once with `networkidle` — within the same timeout budget, so
-  worst case you wait once, not twice.
-- **Dead targets stay single-attempt.** Connection failures and HTTP errors do
-  not get retried; retrying a dead host is just a slower way to fail.
-- **One shared permit pool.** `fast_fetch` and `fast_fetch_multiple` draw from
-  the same 12 slots, so a batch cannot starve a concurrent single fetch.
-- **The 1M-token context of your agent is a budget, not a landfill.**
-  `max_length` exists so the model reads pages, not archives.
+JS-heavy sites often return an empty shell under the default wait strategy.
+When a 200 comes back with no content, the worker retries once with
+`networkidle`, inside the same timeout budget — worst case you wait once, not
+twice. Connection failures and HTTP errors, meanwhile, stay single-attempt:
+retrying a dead host is just a slower way to fail.
+
+`fast_fetch` and `fast_fetch_multiple` draw from the same pool of 12 browser
+slots, so a big batch cannot starve a concurrent single fetch. Demand beyond
+the pool queues; a batch asking for more slots than exist gets what is free.
+
+Finally, `max_length` exists because your agent's context window is a budget,
+not a landfill. The model should read pages, not archives.
 
 ## Troubleshooting
 
@@ -170,7 +172,7 @@ FAST_WEBFETCH_INPUT='{"url":"https://example.com","max_length":500}' \
 
 ## See also
 
-- [ddg-search](../../ddg-search) — the natural front end: searches, then hands
+- [ddg-search](../ddg-search) — the natural front end: searches, then hands
   result URLs to this server
 - [Crawl4AI](https://docs.crawl4ai.com/) — the crawling engine underneath
 - [Model Context Protocol](https://modelcontextprotocol.io) — the wire protocol

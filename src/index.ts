@@ -13,7 +13,7 @@ import { metadataHeader, renderSingle } from "./render.js";
 import { summarizeContent } from "./summary.js";
 
 const server = new Server(
-  { name: "fast-webfetch", version: "6.0.0" },
+  { name: "fast-webfetch", version: "1.1.0" },
   { capabilities: { tools: {} } },
 );
 
@@ -197,5 +197,5 @@ if (process.env.FAST_WEBFETCH_SMOKE_URL) {
 } else {
   const transport = new StdioServerTransport();
   server.connect(transport);
-  console.error("Fast WebFetch MCP server v6 running (local Crawl4AI)");
+  console.error("Fast WebFetch MCP server v1.1.0 running (local Crawl4AI)");
 }

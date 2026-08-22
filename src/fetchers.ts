@@ -40,34 +40,36 @@ function scrapeResult(
   };
 }
 
-export async function fetchMarkdown(
+async function fetchScrape(
+  workerInput: Record<string, unknown>,
   url: string,
-  maxLength: number,
+  key: "markdown" | "raw_html",
   timeoutMs: number,
-  noTruncate = false,
-  outerTimeoutMs = timeoutMs + WORKER_REPORT_GRACE_MS,
+  outerTimeoutMs: number,
 ): Promise<ScrapeResult> {
-  const run = await runWorker({ url, max_length: maxLength, no_truncate: noTruncate }, timeoutMs, 1, outerTimeoutMs);
+  const run = await runWorker(workerInput, timeoutMs, 1, outerTimeoutMs);
   if (!run.ok) return { success: false, error: workerFailureText(run.failure) };
 
   try {
-    return scrapeResult(parseWorkerJson(run.stdout) as Record<string, unknown>, url, "markdown", run.stderrTail);
+    return scrapeResult(parseWorkerJson(run.stdout) as Record<string, unknown>, url, key, run.stderrTail);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { success: false, error: `Crawl4AI worker returned invalid JSON: ${message}` };
   }
 }
 
-export async function fetchRawHtml(url: string, maxLength: number, timeoutMs: number): Promise<ScrapeResult> {
-  const run = await runWorker({ url, max_length: maxLength, raw_html: true }, timeoutMs);
-  if (!run.ok) return { success: false, error: workerFailureText(run.failure) };
+export function fetchMarkdown(
+  url: string,
+  maxLength: number,
+  timeoutMs: number,
+  noTruncate = false,
+  outerTimeoutMs = timeoutMs + WORKER_REPORT_GRACE_MS,
+): Promise<ScrapeResult> {
+  return fetchScrape({ url, max_length: maxLength, no_truncate: noTruncate }, url, "markdown", timeoutMs, outerTimeoutMs);
+}
 
-  try {
-    return scrapeResult(parseWorkerJson(run.stdout) as Record<string, unknown>, url, "raw_html", run.stderrTail);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { success: false, error: `Crawl4AI worker returned invalid JSON: ${message}` };
-  }
+export function fetchRawHtml(url: string, maxLength: number, timeoutMs: number): Promise<ScrapeResult> {
+  return fetchScrape({ url, max_length: maxLength, raw_html: true }, url, "raw_html", timeoutMs, timeoutMs + WORKER_REPORT_GRACE_MS);
 }
 
 export async function fetchMarkdownBatch(urls: string[], maxLength: number, timeoutMs: number): Promise<BatchItem[] | string> {

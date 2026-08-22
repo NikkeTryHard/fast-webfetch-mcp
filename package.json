@@ -1,9 +1,10 @@
 {
   "name": "fast-webfetch-mcp",
   "version": "1.1.0",
-  "description": "High-performance MCP server for web fetching - no blocked sites, full content",
+  "description": "Crawl4AI-backed webfetch MCP: browser-rendered Markdown or raw HTML from a local worker",
   "type": "module",
   "main": "src/index.ts",
+  "author": "cachybtw",
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun run --watch src/index.ts",
@@ -24,6 +25,5 @@
     "scraper",
     "fetch"
   ],
-  "author": "",
   "license": "MIT"
 }
