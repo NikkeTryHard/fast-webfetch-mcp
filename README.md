@@ -81,11 +81,34 @@ VPN so sites see your real IP. Plain `"command": "bun"` works identically.
 | `max_length` | number | 40,000 | Middle-truncation keeps head and tail |
 | `full_content` | boolean | false | Raise cap to 100,000 chars |
 | `timeout_ms` | number | 25,000 | Hard ceiling, browser render included |
+| `options` | object | — | Per-call rendering knobs, see below |
 
 ### `fast_fetch_raw` — one URL to raw HTML
 
 Same arguments minus `prompt`. Use it when Markdown loses the thing you need:
 tables, `data-` attributes, meta tags, exact markup.
+
+### The `options` object
+
+All three tools accept an optional `options` object for sites that need more
+than a plain load-and-grab:
+
+```json
+{
+  "url": "https://example.com/feed",
+  "options": { "full_page": true, "wait_seconds": 1.5, "drop_overlays": true }
+}
+```
+
+| Key | Type | Effect |
+|---|---|---|
+| `full_page` | boolean | Scrolls the entire page before extraction — captures lazy-load and infinite-scroll content. Slower; on endless feeds it scrolls until timeout |
+| `wait_seconds` | number | Settle delay before capture, e.g. `1.5` for pages that hydrate late |
+| `iframes` | boolean | Pulls iframe content into the result |
+| `drop_overlays` | boolean | Removes cookie banners and modals before extraction |
+
+Mistyped keys are dropped silently rather than passed through — the options
+payload becomes CrawlerRunConfig flags on the Python side.
 
 ### `fast_fetch_multiple` — up to 15 URLs in one batch
 
@@ -95,6 +118,7 @@ tables, `data-` attributes, meta tags, exact markup.
 | `max_length` | number | 40,000 | Per URL |
 | `full_content` | boolean | false | Per URL |
 | `timeout_ms` | number | 25,000 | Whole batch, shared |
+| `options` | object | — | Same knobs, applied to every URL |
 
 Each URL comes back as its own section with a metadata header (`url`,
 `status`, `elapsed_ms`, `truncated`). One slow site cannot starve the others —
@@ -121,13 +145,11 @@ All optional, all environment variables.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CRAWL4AI_STEALTH` | off | `1` enables anti-detection browser tweaks |
-| `CRAWL4AI_BROWSER` | chromium | `browser_type` passed to Crawl4AI |
-| `CRAWL4AI_HEADFUL` | off | `1` shows the browser. Yes, on your screen |
+| `CRAWL4AI_STEALTH` | on (`1`) | Anti-detection patches: webdriver flag, plugins, WebGL vendor, Chrome APIs. Set `0` to disable |
 | `CRAWL4AI_PROXY_URL` | off | Proxy for egress |
 | `CRAWL4AI_WAIT_UNTIL` | `domcontentloaded` | Playwright wait strategy |
-| `CRAWL4AI_SCAN_FULL_PAGE` | off | `1` scrolls the page before extraction |
-| `CRAWL4AI_DELAY_SECONDS` | `0` | Settle time before HTML capture |
+| `CRAWL4AI_SCAN_FULL_PAGE` | off | Scroll before extraction — also available per call as `options.full_page` |
+| `CRAWL4AI_DELAY_SECONDS` | `0` | Settle time before HTML capture — also per call as `options.wait_seconds` |
 
 ## Behavior worth knowing
 
