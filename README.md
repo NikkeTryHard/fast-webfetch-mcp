@@ -142,7 +142,39 @@ slots, so a big batch cannot starve a concurrent single fetch. Demand beyond
 the pool queues; a batch asking for more slots than exist gets what is free.
 
 Finally, `max_length` exists because your agent's context window is a budget,
-not a landfill. The model should read pages, not archives.
+not a landfill.
+
+## When things break, you get a log path
+
+Failures are sorted into two piles: the internet being flaky (timeouts, slow
+sites, per-item batch deadline errors) and the tool actually breaking
+(worker won't spawn, worker crashed, stdout overflow, unparseable output).
+Only the second pile writes a log — the first just gets an honest error tag.
+
+A tool-side failure ends with:
+
+```
+log: /path/to/fast-webfetch-mcp/logs/2026-08-22T09-02-06-780Z-fast_fetch.json
+```
+
+Inside: the tool, exact arguments, worker input, and the full failure record
+(stage, exit code, signal, stderr tail) — enough to replay the request
+verbatim:
+
+```sh
+FAST_WEBFETCH_INPUT='{"url":"https://example.com","max_length":40000}' \
+  .venv/bin/python crawl4ai_worker.py
+```
+
+Redirect with `FAST_WEBFETCH_LOGS_DIR`.
+
+## Staying under 30 seconds
+
+Agent harnesses tend to kill MCP calls around the 30-second mark, so this
+server treats 28s as the hard wall. Every tool answers before it: finished
+results if the fetch made it, otherwise structured per-item errors saying
+which stage ate the time. A batch that runs out of budget still returns the
+items that finished.
 
 ## Troubleshooting
 
