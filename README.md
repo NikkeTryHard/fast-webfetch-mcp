@@ -1,147 +1,182 @@
-# Fast WebFetch MCP Server for Claude Code
+# fast-webfetch-mcp
 
-A high-performance MCP server for web fetching in Claude Code using Firecrawl backend with automatic fallback.
+A web-fetching MCP server that renders pages with a real browser running on
+your own machine, then hands the model clean Markdown instead of a token
+bill for 2MB of JavaScript.
 
-## Features
+Fetching costs nothing here: no API keys, no per-page pricing. And when a
+site claims to block you, it is often just a headless-detection script that
+a real Chromium walks straight through.
 
-| Tool                  | Description                                 |
-| --------------------- | ------------------------------------------- |
-| `fast_fetch`          | Fetch URL, extract content, return markdown |
-| `fast_fetch_raw`      | Return raw HTML without processing          |
-| `fast_fetch_json`     | Fetch and parse JSON endpoints              |
-| `fast_fetch_multiple` | Fetch multiple URLs in parallel             |
+## How it works
 
-### How It Works
-
-1. **Primary:** Uses Firecrawl API for JS rendering and comment extraction
-2. **Fallback:** If Firecrawl unavailable, uses direct fetch + Mozilla Readability
-3. **AI Summary:** Optional summarization via local LLM API
+Two small programs, one job:
 
 ```
-URL -> Try Firecrawl -> Success? -> AI Summary (optional) -> Result
-              |
-              v (failed/unavailable)
-       Direct Fetch + Readability -> AI Summary (optional) -> Result
+MCP client (agent)
+   │  JSON-RPC over stdio
+   ▼
+src/index.ts          Bun + MCP SDK — tool schemas, budgets, rendering
+   │  spawns per request
+   ▼
+crawl4ai_worker.py    Python + Crawl4AI — headless Chromium, markdown extraction
+   │
+   ▼
+The actual internet
 ```
 
-### fast_fetch Parameters
+The TypeScript server owns policy: timeouts, concurrency permits, output
+truncation, optional Gemini-powered summarization. The Python worker owns
+mechanics: browser lifecycle, rendering, retries. Neither knows the other's
+job, and the contract between them is one JSON document on stdout.
 
-| Parameter       | Type    | Default  | Description                            |
-| --------------- | ------- | -------- | -------------------------------------- |
-| `url`           | string  | required | The URL to fetch                       |
-| `prompt`        | string  | -        | AI summarization prompt                |
-| `max_length`    | number  | 100000   | Maximum content length (chars)         |
-| `include_links` | boolean | true     | Include hyperlinks in output           |
-| `no_summarize`  | boolean | false    | Skip AI summarization even with prompt |
+## Install
 
-## Quick Install
+Requirements: [Bun](https://bun.sh), Python 3.12+, and a GPU-agnostic amount
+of patience for the first browser download.
 
-### Using Claude CLI (Recommended)
-
-```bash
-# Clone the repo
-git clone https://github.com/nikketryhard/fast-webfetch-mcp.git ~/fast-webfetch-mcp
-
-# Install dependencies
-cd ~/fast-webfetch-mcp && bun install
-
-# Add MCP server with environment variables
-claude mcp add fast-webfetch \
-  -e FIRECRAWL_API_URL=http://localhost:3002 \
-  -e FAST_WEBFETCH_API_URL=http://127.0.0.1:8045/v1 \
-  -e FAST_WEBFETCH_MODEL=gemini-3-flash \
-  -e FAST_WEBFETCH_API_KEY=your_api_key_here \
-  -e FAST_WEBFETCH_USE_RUST=1 \
-  -e FAST_WEBFETCH_RUST_BIN=/home/YOUR_USERNAME/fast-webfetch-mcp/rust/target/release/fast-webfetch-mcp-rs \
-  -- bun run ~/fast-webfetch-mcp/src/index.ts
-
-# Or minimal (uses defaults)
-claude mcp add fast-webfetch -- bun run ~/fast-webfetch-mcp/src/index.ts
+```sh
+git clone <this repo> ~/.local/share/mcp/fast-webfetch-mcp   # or anywhere
+cd ~/.local/share/mcp/fast-webfetch-mcp
+bun install
+uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python crawl4ai
 ```
 
-### Manual Installation
+Verify the browser side works:
 
-```bash
-# Clone the repo
-git clone https://github.com/nikketryhard/fast-webfetch-mcp.git ~/fast-webfetch-mcp
-
-# Install dependencies
-cd ~/fast-webfetch-mcp && bun install
+```sh
+FAST_WEBFETCH_SMOKE_URL=https://example.com bun run src/index.ts
 ```
 
-Then add to `~/.claude.json`:
+You should see Markdown for the example domain. If instead you see a stack
+trace about Playwright browsers, run `crawl4ai-setup` from the venv and try
+again — it installs the right Chromium build for you.
+
+## Wire it into your agent
 
 ```json
 {
   "mcpServers": {
     "fast-webfetch": {
-      "command": "bun",
-      "args": ["run", "/home/YOUR_USERNAME/fast-webfetch-mcp/src/index.ts"],
-      "env": {
-        "FIRECRAWL_API_URL": "http://localhost:3002",
-        "FAST_WEBFETCH_API_URL": "http://127.0.0.1:8045/v1",
-        "FAST_WEBFETCH_MODEL": "gemini-3-flash",
-        "FAST_WEBFETCH_API_KEY": "your_api_key_here",
-        "FAST_WEBFETCH_USE_RUST": "1",
-        "FAST_WEBFETCH_RUST_BIN": "/home/YOUR_USERNAME/fast-webfetch-mcp/rust/target/release/fast-webfetch-mcp-rs"
-      }
+      "type": "stdio",
+      "command": "/usr/bin/mullvad-exclude",
+      "args": ["/home/you/.bun/bin/bun", "run", "/path/to/fast-webfetch-mcp/src/index.ts"],
+      "env": { "PATH": "/home/you/.bun/bin:/usr/bin:/bin" }
     }
   }
 }
 ```
 
-## Environment Variables
+The `mullvad-exclude` wrapper is optional; it just lets fetch traffic bypass a
+VPN so sites see your real IP. Plain `"command": "bun"` works identically.
 
-| Variable                | Default                    | Description                         |
-| ----------------------- | -------------------------- | ----------------------------------- |
-| `FIRECRAWL_API_URL`     | `http://localhost:3002`    | Firecrawl API endpoint              |
-| `FAST_WEBFETCH_API_URL` | `http://127.0.0.1:8045/v1` | OpenAI-compatible API for summaries |
-| `FAST_WEBFETCH_MODEL`   | `gemini-3-flash`           | Model name for summarization        |
-| `FAST_WEBFETCH_API_KEY` | _(empty)_                  | API key for summarization endpoint  |
-| `FAST_WEBFETCH_USE_RUST`| `0`                        | Enable Rust backend worker path     |
-| `FAST_WEBFETCH_RUST_BIN`| _(empty)_                  | Absolute path to Rust binary        |
+## Tools
 
-## Firecrawl Setup (Optional but Recommended)
+### `fast_fetch` — one URL to Markdown
 
-For best results (JS rendering, comments extraction), run Firecrawl locally:
+| Argument | Type | Default | Notes |
+|---|---|---|---|
+| `url` | string | required | |
+| `prompt` | string | — | If set, a grounded answer instead of the full page |
+| `max_length` | number | 40,000 | Middle-truncation keeps head and tail |
+| `full_content` | boolean | false | Raise cap to 100,000 chars |
+| `timeout_ms` | number | 25,000 | Hard ceiling, browser render included |
 
-```bash
-# Using Docker
-docker run -p 3002:3002 mendableai/firecrawl
+### `fast_fetch_raw` — one URL to raw HTML
 
-# Or use the official Firecrawl MCP
-claude mcp add firecrawl-mcp -e FIRECRAWL_API_URL=http://localhost:3002 -- npx -y firecrawl-mcp
+Same arguments minus `prompt`. Use it when Markdown loses the thing you need:
+tables, `data-` attributes, meta tags, exact markup.
+
+### `fast_fetch_multiple` — up to 15 URLs in one batch
+
+| Argument | Type | Default | Notes |
+|---|---|---|---|
+| `urls` | string[] | required | 1–15 absolute http(s) URLs |
+| `max_length` | number | 40,000 | Per URL |
+| `full_content` | boolean | false | Per URL |
+| `timeout_ms` | number | 25,000 | Whole batch, shared |
+
+Each URL comes back as its own section with a metadata header (`url`,
+`status`, `elapsed_ms`, `truncated`). One slow site cannot starve the others —
+it just gets a per-item timeout error while its batch-mates succeed.
+
+## Configuration
+
+All optional, all environment variables.
+
+### Server knobs
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FAST_WEBFETCH_MAX_LENGTH` | `40000` | Default per-page character cap |
+| `FAST_WEBFETCH_HARD_MAX_LENGTH` | `100000` | Ceiling for `full_content` |
+| `FAST_WEBFETCH_TIMEOUT_MS` | `25000` | Default fetch timeout |
+| `FAST_WEBFETCH_MULTIPLE_CONCURRENCY` | `12` | Parallel browser slots (max 32) |
+| `FAST_WEBFETCH_DISABLE_SUMMARY` | unset | `1` removes `prompt` support entirely |
+| `FAST_WEBFETCH_PYTHON` | `<repo>/.venv/bin/python` | Worker interpreter |
+| `FAST_WEBFETCH_WORKER` | `<repo>/crawl4ai_worker.py` | Worker path |
+| `GEMINI_API_KEY` / `GEMINI_API_KEY_FILE` | — | Only needed for `prompt` summarization |
+
+### Browser knobs
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CRAWL4AI_STEALTH` | off | `1` enables anti-detection browser tweaks |
+| `CRAWL4AI_BROWSER` | chromium | `browser_type` passed to Crawl4AI |
+| `CRAWL4AI_HEADFUL` | off | `1` shows the browser. Yes, on your screen |
+| `CRAWL4AI_PROXY_URL` | off | Proxy for egress |
+| `CRAWL4AI_WAIT_UNTIL` | `domcontentloaded` | Playwright wait strategy |
+| `CRAWL4AI_SCAN_FULL_PAGE` | off | `1` scrolls the page before extraction |
+| `CRAWL4AI_DELAY_SECONDS` | `0` | Settle time before HTML capture |
+
+## Behavior worth knowing
+
+JS-heavy sites often return an empty shell under the default wait strategy.
+When a 200 comes back with no content, the worker retries once with
+`networkidle`, inside the same timeout budget — worst case you wait once, not
+twice. Connection failures and HTTP errors, meanwhile, stay single-attempt:
+retrying a dead host is just a slower way to fail.
+
+`fast_fetch` and `fast_fetch_multiple` draw from the same pool of 12 browser
+slots, so a big batch cannot starve a concurrent single fetch. Demand beyond
+the pool queues; a batch asking for more slots than exist gets what is free.
+
+Finally, `max_length` exists because your agent's context window is a budget,
+not a landfill. The model should read pages, not archives.
+
+## Troubleshooting
+
+| Symptom | Likely cause and fix |
+|---|---|
+| `Crawl4AI worker missing` | Repo moved; check `FAST_WEBFETCH_WORKER` points at `crawl4ai_worker.py` |
+| `Crawl4AI python missing` | `.venv` missing or wrong interpreter; set `FAST_WEBFETCH_PYTHON` |
+| Everything times out on one site | Site is genuinely slow or hostile; try `CRAWL4AI_STEALTH=1` |
+| `Batch deadline exceeded` on some items | Expected: shared 25s budget, stragglers get per-item errors |
+| Empty markdown on SPAs | Should self-heal via retry; if not, raise `CRAWL4AI_DELAY_SECONDS` |
+
+## Development
+
+```sh
+bun install
+bun test            # 18 tests, no network needed
+bun run typecheck   # tsc --noEmit, strict + noUncheckedIndexedAccess
 ```
 
-Without Firecrawl, the server falls back to direct fetch + Readability (no JS rendering).
+The Python worker can be driven directly, which is the fastest way to debug
+fetch behavior without the MCP layer:
 
-## Comparison with Native WebFetch
+```sh
+FAST_WEBFETCH_INPUT='{"url":"https://example.com","max_length":500}' \
+  .venv/bin/python crawl4ai_worker.py
+```
 
-| Feature        | Native WebFetch       | Fast WebFetch        |
-| -------------- | --------------------- | -------------------- |
-| Reddit/Twitter | Blocked (403)         | Works                |
-| User agent     | Claude-User (blocked) | Real browser UA      |
-| JS rendering   | No                    | Yes (with Firecrawl) |
-| Comments       | No                    | Yes (with Firecrawl) |
-| Content        | Haiku-summarized      | Full markdown        |
-| AI summary     | Haiku 3.5             | Configurable model   |
-| Max length     | 100KB                 | Configurable         |
-| Raw HTML       | No                    | Yes                  |
-| JSON fetch     | No                    | Yes                  |
-| Parallel fetch | No                    | Yes                  |
-| Fallback       | None                  | Direct fetch         |
+## See also
 
-## Requirements
-
-- [Bun](https://bun.sh/) runtime
-- Claude Code 2.0+
-- (Optional) Firecrawl for JS rendering
-- (Optional) OpenAI-compatible API for summarization
+- [ddg-search](../ddg-search) — the natural front end: searches, then hands
+  result URLs to this server
+- [Crawl4AI](https://docs.crawl4ai.com/) — the crawling engine underneath
+- [Model Context Protocol](https://modelcontextprotocol.io) — the wire protocol
 
 ## License
 
-MIT
-
-## Contributing
-
-PRs welcome! Please open an issue first to discuss changes.
+MIT.

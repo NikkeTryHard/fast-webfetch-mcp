@@ -1,816 +1,201 @@
 #!/usr/bin/env bun
 /**
- * Fast WebFetch MCP Server
- * High-performance web fetching for Claude Code using Firecrawl backend
- * With fallback to direct fetch + Readability when Firecrawl is unavailable
- * With AI summarization via local LLM API
+ * Crawl4AI-backed MCP server. Markdown fetches go through the local Python worker.
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { Readability } from "@mozilla/readability";
-import { JSDOM } from "jsdom";
-import TurndownService from "turndown";
-import { spawn } from "node:child_process";
 
-// Default max content length (characters)
-const DEFAULT_MAX_LENGTH = 100000;
-const DEFAULT_TIMEOUT_MS = 30000;
-const DEFAULT_MAX_BYTES = 4 * 1024 * 1024;
+import { CONFIG, MAX_CRAWL_TIMEOUT_MS, REQUEST_BUDGET_MS, TRANSPORT_MARGIN_MS, WORKER_REPORT_GRACE_MS, asArgs, readPositiveInt, resolveMaxLength, resolveTimeoutMs } from "./config.js";
+import { fetchMarkdown, fetchMarkdownBatch, fetchRawHtml } from "./fetchers.js";
+import { metadataHeader, renderSingle } from "./render.js";
+import { summarizeContent } from "./summary.js";
 
-// Firecrawl config
-const FIRECRAWL_API_URL = process.env.FIRECRAWL_API_URL || "http://localhost:3002";
-
-// AI summarization config
-const AI_API_URL = process.env.FAST_WEBFETCH_API_URL || "http://127.0.0.1:8045/v1";
-const AI_MODEL = process.env.FAST_WEBFETCH_MODEL || "gemini-3-flash";
-const AI_API_KEY = process.env.FAST_WEBFETCH_API_KEY || process.env.OPENAI_API_KEY || "";
-const USE_RUST_BACKEND = process.env.FAST_WEBFETCH_USE_RUST === "1";
-const RUST_BACKEND_BIN = process.env.FAST_WEBFETCH_RUST_BIN || "";
-
-// User agents for fallback fetch
-const USER_AGENTS = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"];
-
-// Turndown service for HTML to Markdown conversion (fallback)
-const turndown = new TurndownService({
-  headingStyle: "atx",
-  codeBlockStyle: "fenced",
-  bulletListMarker: "-",
-});
-turndown.remove(["script", "style", "nav", "footer", "aside", "noscript", "iframe"]);
-
-/**
- * Get a random user agent
- */
-function getRandomUserAgent(): string {
-  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
-
-/**
- * Summarize content using local LLM API (OpenAI-compatible)
- */
-async function summarizeContent(content: string, userPrompt: string): Promise<string> {
-  const prompt = `Web page content:
----
-${content}
----
-
-${userPrompt}
-
-Provide a concise response based only on the content above.`;
-
-  try {
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
-
-    if (AI_API_KEY) {
-      headers.Authorization = `Bearer ${AI_API_KEY}`;
-    }
-
-    const response = await fetch(`${AI_API_URL}/chat/completions`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: AI_MODEL,
-        messages: [
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
-        max_tokens: 4096,
-        temperature: 0.3,
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`AI API returned ${response.status}`);
-    }
-
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || "Failed to generate summary";
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return `[Summarization failed: ${message}]\n\n${content.slice(0, 5000)}...`;
-  }
-}
-
-type RustBackendAttempt =
-  | { status: "disabled" }
-  | { status: "bootstrap_error"; message: string }
-  | { status: "worker_error"; result: ScrapeResult }
-  | { status: "ok"; result: ScrapeResult };
-
-async function callRustBackend(url: string, maxLength: number, timeoutMs: number): Promise<RustBackendAttempt> {
-  if (!USE_RUST_BACKEND || !RUST_BACKEND_BIN) {
-    return { status: "disabled" };
-  }
-
-  return await new Promise((resolve) => {
-    const input = JSON.stringify({
-      url,
-      max_length: maxLength,
-      max_bytes: DEFAULT_MAX_BYTES,
-      timeout_ms: timeoutMs,
-    });
-
-    const child = spawn(RUST_BACKEND_BIN, [], {
-      env: {
-        ...process.env,
-        FAST_WEBFETCH_INPUT: input,
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-
-    const settle = (result: RustBackendAttempt): void => {
-      if (settled) return;
-      settled = true;
-      resolve(result);
-    };
-
-    const timeoutId = setTimeout(() => {
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 1000);
-      settle({
-        status: "bootstrap_error",
-        message: `Rust backend timed out after ${timeoutMs}ms`,
-      });
-    }, timeoutMs + 1000);
-
-    child.stdout.on("data", (chunk: Buffer | string) => {
-      stdout += chunk.toString();
-    });
-
-    child.stderr.on("data", (chunk: Buffer | string) => {
-      stderr += chunk.toString();
-    });
-
-    child.on("error", (error) => {
-      clearTimeout(timeoutId);
-      settle({
-        status: "bootstrap_error",
-        message: error instanceof Error ? error.message : String(error),
-      });
-    });
-
-    child.on("close", (code) => {
-      clearTimeout(timeoutId);
-
-      if (code !== 0) {
-        settle({
-          status: "worker_error",
-          result: {
-            success: false,
-            error: `Rust backend exited with code ${code}`,
-            errorDetails: {
-              stage: "rust",
-              kind: "runtime",
-              message: stderr.trim() || `exit code ${code}`,
-            },
-          },
-        });
-        return;
-      }
-
-      try {
-        const parsed = JSON.parse(stdout);
-        const markdown = typeof parsed.markdown === "string" ? parsed.markdown : "";
-        const title = typeof parsed.title === "string" ? parsed.title : "";
-        const finalUrl = typeof parsed.url === "string" ? parsed.url : url;
-        const statusCode = typeof parsed.status === "number" ? parsed.status : 200;
-        const backend = parsed.backend === "firecrawl" ? "firecrawl" : "fallback";
-
-        if (!markdown) {
-          settle({
-            status: "worker_error",
-            result: {
-              success: false,
-              error: "Rust backend returned empty markdown",
-              errorDetails: {
-                stage: "rust",
-                kind: "parse",
-                message: "markdown missing or empty",
-              },
-            },
-          });
-          return;
-        }
-
-        settle({
-          status: "ok",
-          result: {
-            success: true,
-            markdown,
-            metadata: {
-              title,
-              sourceURL: finalUrl,
-              statusCode,
-            },
-            usedFallback: backend !== "firecrawl",
-          },
-        });
-      } catch (error) {
-        const parseMessage = error instanceof Error ? error.message : String(error);
-        if (stderr.trim()) {
-          settle({
-            status: "worker_error",
-            result: {
-              success: false,
-              error: "Rust backend returned invalid JSON",
-              errorDetails: {
-                stage: "rust",
-                kind: "parse",
-                message: `${parseMessage}; stderr: ${stderr.trim()}`,
-              },
-            },
-          });
-          return;
-        }
-        settle({
-          status: "worker_error",
-          result: {
-            success: false,
-            error: "Rust backend returned invalid JSON",
-            errorDetails: {
-              stage: "rust",
-              kind: "parse",
-              message: parseMessage,
-            },
-          },
-        });
-      }
-    });
-  });
-}
-
-/**
- * Middle-truncate content to preserve beginning and end
- */
-function middleTruncate(text: string, maxLength: number): string {
-  if (text.length <= maxLength) return text;
-
-  const halfLength = Math.floor((maxLength - 100) / 2);
-  const start = text.slice(0, halfLength);
-  const end = text.slice(-halfLength);
-  const truncatedChars = text.length - maxLength;
-
-  return `${start}\n\n... [truncated ${truncatedChars} characters] ...\n\n${end}`;
-}
-
-/**
- * Convert HTML to Markdown
- */
-function htmlToMarkdown(html: string): string {
-  try {
-    return turndown.turndown(html);
-  } catch {
-    return html
-      .replace(/<[^>]*>/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-}
-
-/**
- * Extract main content using Mozilla Readability (fallback)
- */
-function extractContent(html: string, url: string): { title: string; content: string; excerpt: string; byline: string | null } | null {
-  try {
-    const dom = new JSDOM(html, { url });
-    const reader = new Readability(dom.window.document);
-    const article = reader.parse();
-
-    if (!article) {
-      return null;
-    }
-
-    return {
-      title: article.title || "",
-      content: article.content || "",
-      excerpt: article.excerpt || "",
-      byline: article.byline,
-    };
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Fallback: Fetch URL directly with browser UA
- */
-async function directFetch(url: string, options: { timeout?: number } = {}): Promise<{ html: string; status: number; finalUrl: string }> {
-  const { timeout = DEFAULT_TIMEOUT_MS } = options;
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
-
-  try {
-    const response = await fetch(url, {
-      headers: {
-        "User-Agent": getRandomUserAgent(),
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Cache-Control": "no-cache",
-      },
-      signal: controller.signal,
-      redirect: "follow",
-    });
-
-    clearTimeout(timeoutId);
-
-    const html = await response.text();
-    return {
-      html,
-      status: response.status,
-      finalUrl: response.url,
-    };
-  } catch (error) {
-    clearTimeout(timeoutId);
-    throw error;
-  }
-}
-
-async function directFetchJson(url: string, timeout = DEFAULT_TIMEOUT_MS): Promise<{ status: number; data?: unknown; error?: string }> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
-
-  try {
-    const response = await fetch(url, {
-      headers: {
-        Accept: "application/json",
-        "User-Agent": getRandomUserAgent(),
-      },
-      signal: controller.signal,
-      redirect: "follow",
-    });
-
-    if (!response.ok) {
-      return { status: response.status, error: `HTTP ${response.status}` };
-    }
-
-    const text = await response.text();
-    if (text.length > DEFAULT_MAX_BYTES) {
-      return { status: 413, error: `Response too large (${text.length} bytes)` };
-    }
-
-    try {
-      return { status: response.status, data: JSON.parse(text) };
-    } catch {
-      return { status: response.status, error: "Invalid JSON response" };
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { status: 500, error: message };
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
-
-// Scrape result type
-type ScrapeResult = {
-  success: boolean;
-  markdown?: string;
-  html?: string;
-  rawHtml?: string;
-  links?: string[];
-  metadata?: {
-    title?: string;
-    description?: string;
-    sourceURL?: string;
-    statusCode?: number;
-  };
-  error?: string;
-  errorDetails?: {
-    stage: "rust" | "firecrawl" | "fallback" | "json";
-    kind: "timeout" | "spawn" | "parse" | "http" | "runtime" | "unknown";
-    message: string;
-  };
-  usedFallback?: boolean;
-};
-
-/**
- * Fetch URL using Firecrawl API with fallback to direct fetch
- */
-async function scrapeUrl(
-  url: string,
-  options: {
-    formats?: string[];
-    onlyMainContent?: boolean;
-    timeout?: number;
-  } = {},
-): Promise<ScrapeResult> {
-  const { formats = ["markdown"], onlyMainContent = true, timeout = DEFAULT_TIMEOUT_MS } = options;
-
-  if (formats.length === 1 && formats[0] === "markdown") {
-    const rustAttempt = await callRustBackend(url, DEFAULT_MAX_LENGTH, timeout);
-    if (rustAttempt.status === "ok") {
-      return rustAttempt.result;
-    }
-    if (rustAttempt.status === "worker_error") {
-      return rustAttempt.result;
-    }
-  }
-
-  // Try Firecrawl first
-  let firecrawlErrorMessage = "";
-  const firecrawlAbort = new AbortController();
-  const firecrawlTimeoutId = setTimeout(() => firecrawlAbort.abort(), timeout);
-  try {
-    const response = await fetch(`${FIRECRAWL_API_URL}/v1/scrape`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        url,
-        formats,
-        onlyMainContent,
-        timeout,
-      }),
-      signal: firecrawlAbort.signal,
-    });
-
-    if (response.ok) {
-      const data = await response.json();
-
-      if (data.success) {
-        return {
-          success: true,
-          markdown: data.data?.markdown,
-          html: data.data?.html,
-          rawHtml: data.data?.rawHtml,
-          links: data.data?.links,
-          metadata: data.data?.metadata,
-          usedFallback: false,
-        };
-      }
-    } else {
-      firecrawlErrorMessage = `Firecrawl HTTP ${response.status}`;
-    }
-  } catch (error) {
-    firecrawlErrorMessage = error instanceof Error ? error.message : String(error);
-  } finally {
-    clearTimeout(firecrawlTimeoutId);
-  }
-
-  // Fallback: Direct fetch with Readability
-  try {
-    const { html, status, finalUrl } = await directFetch(url, { timeout });
-
-    if (status >= 400) {
-      return {
-        success: false,
-        error: `HTTP ${status}`,
-      };
-    }
-
-    // Check if raw HTML was requested
-    if (formats.includes("rawHtml")) {
-      return {
-        success: true,
-        rawHtml: html,
-        metadata: {
-          sourceURL: finalUrl,
-          statusCode: status,
-        },
-        usedFallback: true,
-      };
-    }
-
-    // Extract content with Readability
-    const article = extractContent(html, finalUrl);
-    let markdown: string;
-    let title = "";
-
-    if (article) {
-      title = article.title;
-      markdown = htmlToMarkdown(article.content);
-    } else {
-      markdown = htmlToMarkdown(html);
-    }
-
-    return {
-      success: true,
-      markdown,
-      metadata: {
-        title,
-        sourceURL: finalUrl,
-        statusCode: status,
-      },
-      usedFallback: true,
-    };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return {
-      success: false,
-      error: firecrawlErrorMessage ? `Firecrawl failed (${firecrawlErrorMessage}); fallback failed (${message})` : message,
-    };
-  }
-}
-
-// Create MCP server
 const server = new Server(
-  {
-    name: "fast-webfetch",
-    version: "2.1.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  },
+  { name: "fast-webfetch", version: "1.1.0" },
+  { capabilities: { tools: {} } },
 );
 
-// List available tools
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      {
-        name: "fast_fetch",
-        description: "Fetch a URL using Firecrawl (with fallback to direct fetch). If a prompt is provided, uses AI to summarize the content. Works with sites that block Claude's native WebFetch (Reddit, Twitter, etc.) and extracts comments/dynamic content when Firecrawl is available.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            url: {
-              type: "string",
-              description: "The URL to fetch",
-            },
-            prompt: {
-              type: "string",
-              description: "What information to look for - AI will summarize content based on this prompt",
-            },
-            max_length: {
-              type: "number",
-              description: `Maximum content length in characters (default ${DEFAULT_MAX_LENGTH})`,
-            },
-            include_links: {
-              type: "boolean",
-              description: "Include hyperlinks in the markdown output (default: true)",
-            },
-            no_summarize: {
-              type: "boolean",
-              description: "Skip AI summarization even if prompt is provided (return raw markdown)",
-            },
-          },
-          required: ["url"],
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: "fast_fetch",
+      description: CONFIG.disableSummary
+        ? "Open one known URL and return source-grounded Markdown from local Crawl4AI. Use after search when URL likely contains answer, or when user gives URL. Not web search. Returns fetched page content only; no AI summary. Use full_content when truncation would hide needed facts; timeout capped at 25s."
+        : "Open one known URL and return source-grounded Markdown from local Crawl4AI, or answer a specific prompt using only fetched content. Use after search when URL likely contains answer, or when user gives URL. Not web search. With prompt, answer must stay grounded in fetched content and say when content lacks answer. Use full_content when truncation would hide needed facts; timeout capped at 25s.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "URL to fetch" },
+          ...(CONFIG.disableSummary ? {} : { prompt: { type: "string", description: "Optional extraction/question. If set, returns concise answer grounded only in fetched content; must not infer beyond page." } }),
+          max_length: { type: "number", description: `Maximum returned Markdown chars. Default ${CONFIG.maxLength}; hard max ${CONFIG.hardMaxLength}. Raise when page truncation hides needed facts.` },
+          full_content: { type: "boolean", description: `Use hard max ${CONFIG.hardMaxLength} chars instead of default cap. Use for long docs/specs/source pages.` },
+          timeout_ms: { type: "number", description: `Fetch timeout ms. Default ${CONFIG.timeoutMs}; max ${MAX_CRAWL_TIMEOUT_MS}.` },
         },
+        required: ["url"],
       },
-      {
-        name: "fast_fetch_raw",
-        description: "Fetch a URL and return raw HTML. Useful for debugging or when you need the original page structure.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            url: {
-              type: "string",
-              description: "The URL to fetch",
-            },
-            max_length: {
-              type: "number",
-              description: `Maximum content length in characters (default ${DEFAULT_MAX_LENGTH})`,
-            },
-          },
-          required: ["url"],
+    },
+    {
+      name: "fast_fetch_raw",
+      description: "Open one known URL and return raw HTML from local Crawl4AI. Use only when Markdown loses needed evidence: structured markup, scripts/data attributes, meta tags, tables, or exact HTML snippets. Not web search. Prefer fast_fetch for normal reading. full_content raises cap; timeout capped at 25s.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "URL to fetch" },
+          max_length: { type: "number", description: `Maximum returned HTML chars. Default ${CONFIG.maxLength}; hard max ${CONFIG.hardMaxLength}.` },
+          full_content: { type: "boolean", description: `Use hard max ${CONFIG.hardMaxLength} chars instead of default cap. Use when required markup may be late in document.` },
+          timeout_ms: { type: "number", description: `Fetch timeout ms. Default ${CONFIG.timeoutMs}; max ${MAX_CRAWL_TIMEOUT_MS}.` },
         },
+        required: ["url"],
       },
-      {
-        name: "fast_fetch_json",
-        description: "Fetch a URL that returns JSON and parse it.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            url: {
-              type: "string",
-              description: "The URL to fetch (should return JSON)",
-            },
+    },
+    {
+      name: "fast_fetch_multiple",
+      description:
+        "Open multiple known URLs in one parallel Crawl4AI batch and return Markdown for comparison/triage. " +
+        "Use after search when several candidate pages need grounding. Not web search. " +
+        "Pass up to ~15 URLs; process runs up to FAST_WEBFETCH_MULTIPLE_CONCURRENCY pages at once (default 12). " +
+        "max_length applies per URL. One overall batch timeout capped at 25s — huge batches may partial-timeout.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          urls: {
+            type: "array",
+            items: { type: "string" },
+            minItems: 1,
+            maxItems: 15,
+            description: "1–15 absolute http(s) URLs. Parallelism capped by process concurrency (default 12).",
           },
-          required: ["url"],
-        },
-      },
-      {
-        name: "fast_fetch_multiple",
-        description: "Fetch multiple URLs in parallel and return all results.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            urls: {
-              type: "array",
-              items: { type: "string" },
-              description: "Array of URLs to fetch",
-            },
-            max_length: {
-              type: "number",
-              description: `Maximum content length per URL in characters (default ${DEFAULT_MAX_LENGTH})`,
-            },
+          max_length: {
+            type: "number",
+            description: `Maximum returned Markdown chars per URL. Default ${CONFIG.maxLength}; hard max ${CONFIG.hardMaxLength}.`,
           },
-          required: ["urls"],
+          full_content: {
+            type: "boolean",
+            description: `Use hard max ${CONFIG.hardMaxLength} chars per URL instead of default cap. Use for long docs/specs/source pages.`,
+          },
+          timeout_ms: {
+            type: "number",
+            description: `Whole batch timeout ms. Default ${CONFIG.timeoutMs}; max ${MAX_CRAWL_TIMEOUT_MS}.`,
+          },
         },
+        required: ["urls"],
       },
-    ],
-  };
-});
+    },
+  ],
+}));
 
-// Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name: toolName, arguments: args } = request.params;
+  const { name } = request.params;
+  const args = asArgs(request.params.arguments);
 
   try {
-    switch (toolName) {
-      case "fast_fetch": {
-        const url = args.url as string;
-        const maxLength = (args.max_length as number) || DEFAULT_MAX_LENGTH;
-        const includeLinks = args.include_links !== false;
-        const userPrompt = args.prompt as string | undefined;
-        const noSummarize = args.no_summarize as boolean;
+    const maxLength = resolveMaxLength(args);
+    const timeoutMs = resolveTimeoutMs(args);
 
-        const result = await scrapeUrl(url, {
-          formats: ["markdown"],
-          onlyMainContent: true,
-        });
+    if (name === "fast_fetch") {
+      const requestStartedAt = Date.now();
+      const requestDeadline = requestStartedAt + REQUEST_BUDGET_MS;
+      const url = args.url as string;
+      const prompt = !CONFIG.disableSummary && typeof args.prompt === "string" && args.prompt.trim() ? args.prompt.trim() : undefined;
+      const crawlBudgetMs = timeoutMs;
+      const workerBudgetMs = Math.min(requestDeadline - requestStartedAt - TRANSPORT_MARGIN_MS, crawlBudgetMs + WORKER_REPORT_GRACE_MS);
+      const result = await fetchMarkdown(url, maxLength, crawlBudgetMs, prompt !== undefined, workerBudgetMs);
 
-        if (!result.success) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Error fetching ${url}: ${result.error}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-
-        let markdown = result.markdown || "";
-        const title = result.metadata?.title || "";
-        const finalUrl = result.metadata?.sourceURL || url;
-        const backend = result.usedFallback ? "fallback" : "firecrawl";
-
-        // Remove links if requested
-        if (!includeLinks) {
-          markdown = markdown.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
-        }
-
-        // Truncate if needed
-        markdown = middleTruncate(markdown, maxLength);
-
-        // If prompt provided and not skipping summarization, use AI to summarize
-        if (userPrompt && !noSummarize) {
-          const summary = await summarizeContent(markdown, userPrompt);
-          return {
-            content: [
-              {
-                type: "text",
-                text: `# ${title || "Fetched Content"}\n**URL:** ${finalUrl}\n**Backend:** ${backend}\n\n${summary}`,
-              },
-            ],
-          };
-        }
-
-        const output = [`# ${title || "Fetched Content"}`, `**URL:** ${finalUrl}`, `**Backend:** ${backend}`, "", markdown].join("\n");
-
-        return {
-          content: [{ type: "text", text: output }],
-        };
+      if (!result.success) {
+        return { content: [{ type: "text", text: `Error fetching ${url}: ${result.error}` }], isError: true };
       }
 
-      case "fast_fetch_raw": {
-        const url = args.url as string;
-        const maxLength = (args.max_length as number) || DEFAULT_MAX_LENGTH;
-
-        const result = await scrapeUrl(url, {
-          formats: ["rawHtml"],
-          onlyMainContent: false,
-        });
-
-        if (!result.success) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Error fetching ${url}: ${result.error}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-
-        const html = result.rawHtml || "";
-        const finalUrl = result.metadata?.sourceURL || url;
-        const statusCode = result.metadata?.statusCode || 200;
-        const backend = result.usedFallback ? "fallback" : "firecrawl";
-
-        const truncatedHtml = middleTruncate(html, maxLength);
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: `URL: ${finalUrl}\nStatus: ${statusCode}\nBackend: ${backend}\n\n${truncatedHtml}`,
-            },
-          ],
-        };
+      const markdown = result.markdown || "";
+      if (prompt) {
+        const summaryBudgetMs = requestDeadline - Date.now() - TRANSPORT_MARGIN_MS;
+        const summary = await summarizeContent(markdown, prompt, summaryBudgetMs);
+        return { content: [{ type: "text", text: renderSingle(summary, result, false) }] };
       }
 
-      case "fast_fetch_json": {
-        const url = args.url as string;
-
-        const jsonResult = await directFetchJson(url);
-        if (jsonResult.error || typeof jsonResult.data === "undefined") {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Error: ${jsonResult.error || "Unknown error"} fetching ${url}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(jsonResult.data, null, 2),
-            },
-          ],
-        };
-      }
-
-      case "fast_fetch_multiple": {
-        const urls = args.urls as string[];
-        const maxLength = (args.max_length as number) || DEFAULT_MAX_LENGTH;
-
-        const results = await Promise.allSettled(
-          urls.map(async (url) => {
-            const result = await scrapeUrl(url, {
-              formats: ["markdown"],
-              onlyMainContent: true,
-            });
-
-            if (!result.success) {
-              return { url, error: result.error };
-            }
-
-            let markdown = result.markdown || "";
-            const title = result.metadata?.title || "";
-            const finalUrl = result.metadata?.sourceURL || url;
-
-            markdown = middleTruncate(markdown, Math.floor(maxLength / urls.length));
-
-            return { url: finalUrl, title, content: markdown };
-          }),
-        );
-
-        type MultiFetchItem =
-          | { url: string; error: string }
-          | { url: string; title: string; content: string };
-
-        const output = results
-          .map((result, i) => {
-            if (result.status === "rejected") {
-              return `## ${urls[i]}\n\nError: ${result.reason}`;
-            }
-
-            const item = result.value as MultiFetchItem;
-
-            if ("error" in item) {
-              return `## ${item.url}\n\nError: ${item.error}`;
-            }
-
-            return `## ${item.title || item.url}\n\n**URL:** ${item.url}\n\n${item.content}`;
-          })
-          .join("\n\n---\n\n");
-
-        return {
-          content: [{ type: "text", text: output }],
-        };
-      }
-
-      default:
-        throw new Error(`Unknown tool: ${toolName}`);
+      return { content: [{ type: "text", text: renderSingle(markdown, result) }] };
     }
+
+    if (name === "fast_fetch_raw") {
+      const url = args.url as string;
+      const result = await fetchRawHtml(url, maxLength, timeoutMs);
+      if (!result.success) {
+        return { content: [{ type: "text", text: `Error fetching ${url}: ${result.error}` }], isError: true };
+      }
+      return { content: [{ type: "text", text: renderSingle(result.rawHtml || "", result) }] };
+    }
+
+    if (name === "fast_fetch_multiple") {
+      const urls = Array.isArray(args.urls) ? (args.urls as string[]) : [];
+      const result = await fetchMarkdownBatch(urls, maxLength, timeoutMs);
+      if (typeof result === "string") {
+        return { content: [{ type: "text", text: `Error fetching multiple URLs: ${result}` }], isError: true };
+      }
+
+      const output = result.map((item) => {
+        if (item.status === "error") {
+          return `${metadataHeader({
+            url: item.input_url,
+            status: item.status_code,
+            backend: item.backend,
+            stage: item.stage,
+            error_type: item.error_type,
+            elapsed_ms: item.elapsed_ms,
+            timeout_ms: item.timeout_ms,
+            truncated: false,
+          })}\n\nError: ${item.error}`;
+        }
+        return `${metadataHeader({
+          url: item.input_url,
+          status: item.status_code ?? 200,
+          backend: item.backend,
+          elapsed_ms: item.elapsed_ms,
+          timeout_ms: item.timeout_ms,
+          truncated: item.truncated ?? false,
+        })}\n\n${item.markdown}`;
+      }).join("\n\n---\n\n");
+      return { content: [{ type: "text", text: output }] };
+    }
+
+    throw new Error(`Unknown tool: ${name}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Error: ${message}`,
-        },
-      ],
-      isError: true,
-    };
+    return { content: [{ type: "text", text: `Error: ${message}` }], isError: true };
   }
 });
 
-// Start server
-const transport = new StdioServerTransport();
-server.connect(transport);
-console.error("Fast WebFetch MCP server v2.1 running (Firecrawl + fallback)");
+async function runCliSmoke(): Promise<void> {
+  const url = process.env.FAST_WEBFETCH_SMOKE_URL;
+  if (!url) return;
+
+  const smokeTimeoutMs = readPositiveInt("FAST_WEBFETCH_SMOKE_TIMEOUT_MS", CONFIG.timeoutMs, MAX_CRAWL_TIMEOUT_MS);
+  const result = await fetchMarkdown(
+    url,
+    readPositiveInt("FAST_WEBFETCH_SMOKE_MAX_LENGTH", 1000, CONFIG.hardMaxLength),
+    smokeTimeoutMs,
+  );
+  if (!result.success) {
+    console.error(`Error fetching ${url}: ${result.error}`);
+    process.exit(1);
+  }
+
+  if (CONFIG.disableSummary) {
+    console.log(renderSingle(result.markdown || "", result));
+    return;
+  }
+
+  const prompt = process.env.FAST_WEBFETCH_SMOKE_PROMPT || "Summarize the fetched page.";
+  console.log(await summarizeContent(result.markdown || "", prompt, Math.min(CONFIG.geminiTimeoutMs, REQUEST_BUDGET_MS - smokeTimeoutMs - TRANSPORT_MARGIN_MS)));
+}
+
+if (process.env.FAST_WEBFETCH_SMOKE_URL) {
+  runCliSmoke().catch((error) => {
+    console.error(error instanceof Error ? error.stack || error.message : String(error));
+    process.exit(1);
+  });
+} else {
+  const transport = new StdioServerTransport();
+  server.connect(transport);
+  console.error("Fast WebFetch MCP server v1.1.0 running (local Crawl4AI)");
+}
