@@ -1,7 +1,14 @@
 import { CONFIG, WORKER_REPORT_GRACE_MS } from "./config.js";
+import { isSeriousFailure, writeErrorLog } from "./diagnostics.js";
 import { workerFailureText } from "./render.js";
 import { parseWorkerJson, runWorker } from "./worker.js";
-import type { BatchItem, ScrapeResult } from "./types.js";
+import type { BatchItem, ScrapeResult, WorkerFailure } from "./types.js";
+
+export function withLog(tool: string, error: string, failure: WorkerFailure | undefined, payload: Record<string, unknown>): string {
+  if (!failure || !isSeriousFailure(failure.stage)) return error;
+  const path = writeErrorLog(tool, { ...payload, failure });
+  return path ? `${error}\nlog: ${path}` : error;
+}
 
 function scrapeResult(
   parsed: Record<string, unknown>,
@@ -48,15 +55,20 @@ async function fetchScrape(
   outerTimeoutMs: number,
 ): Promise<ScrapeResult> {
   const run = await runWorker(workerInput, timeoutMs, 1, outerTimeoutMs);
-  if (!run.ok) return { success: false, error: workerFailureText(run.failure) };
+  if (!run.ok) {
+    return { success: false, error: withLog("fast_fetch", workerFailureText(run.failure), run.failure, { url, workerInput }) };
+  }
 
   try {
     return scrapeResult(parseWorkerJson(run.stdout) as Record<string, unknown>, url, key, run.stderrTail);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return { success: false, error: `Crawl4AI worker returned invalid JSON: ${message}` };
+    const detail = `Crawl4AI worker returned invalid JSON: ${message}`;
+    const path = writeErrorLog("fast_fetch", { url, workerInput, stdout_tail: run.stdout.slice(-2000), message });
+    return { success: false, error: path ? `${detail}\nlog: ${path}` : detail };
   }
 }
+
 
 export function fetchMarkdown(
   url: string,
@@ -75,7 +87,9 @@ export function fetchRawHtml(url: string, maxLength: number, timeoutMs: number):
 export async function fetchMarkdownBatch(urls: string[], maxLength: number, timeoutMs: number): Promise<BatchItem[] | string> {
   const permitCount = Math.max(1, Math.min(CONFIG.multipleConcurrency, urls.length));
   const run = await runWorker({ urls, max_length: maxLength }, timeoutMs, permitCount);
-  if (!run.ok) return workerFailureText(run.failure);
+  if (!run.ok) {
+    return withLog("fast_fetch_multiple", workerFailureText(run.failure), run.failure, { urls, max_length: maxLength });
+  }
 
   try {
     const parsed = parseWorkerJson(run.stdout);
